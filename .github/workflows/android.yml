@@ -22,7 +22,7 @@ env:
   # SDL2 2.0.12 zip hash (from the Dockerfile of the base repo)
   SDL_SHA256: 476e84d6fcbc499cd1f4a2d3fd05a924abc165b5d0e0d53522c9604fe5a021aa
   NDK_VERSION: 21.4.7075529
-  ABI: arm64-v8a
+  ABI: armeabi-v7a
 
 jobs:
   build:
@@ -128,6 +128,10 @@ jobs:
           for f in build/us_pc/assets/mario_anim_data.c \
                    build/us_pc/assets/demo_data.c \
                    build/us_pc/include/level_headers.h \
+                   build/us_pc/sound/sound_data.ctl.le.32.inc.c \
+                   build/us_pc/sound/sound_data.tbl.le.32.inc.c \
+                   build/us_pc/sound/sequences.bin.le.32.inc.c \
+                   build/us_pc/sound/bank_sets.le.32.inc.c \
                    levels/bob/0.rgba16.png; do
             if [ ! -f "$f" ]; then echo "::error::missing generated file: $f"; missing=1; fi
           done
@@ -160,11 +164,15 @@ jobs:
           yes | JAVA_HOME="$SDK_JAVA" "$SDKM" --licenses > /dev/null || true
           JAVA_HOME="$SDK_JAVA" "$SDKM" --install "platforms;android-26" "build-tools;30.0.2" "ndk;$NDK_VERSION"
 
-      - name: Restrict to one ABI to keep the build small and fast
+      - name: Restrict native build to one ABI (32-bit ARM, armeabi-v7a)
         working-directory: android-base
         run: |
           sed -i "s/abiFilters 'armeabi-v7a', 'arm64-v8a', 'x86', 'x86_64'/abiFilters '$ABI'/" app/build.gradle
+          sed -i "s/^APP_ABI := .*/APP_ABI := $ABI/" app/jni/Application.mk
           grep -n "abiFilters" app/build.gradle
+          grep -n "^APP_ABI" app/jni/Application.mk
+          grep -q "^ *abiFilters '$ABI'\$" app/build.gradle || { echo "::error::abiFilters was not rewritten to $ABI"; exit 1; }
+          grep -q "^APP_ABI := $ABI\$" app/jni/Application.mk || { echo "::error::APP_ABI was not rewritten to $ABI"; exit 1; }
 
       - name: Build debug APK
         working-directory: android-base
@@ -172,22 +180,41 @@ jobs:
           chmod +x gradlew
           ./gradlew assembleDebug --no-daemon --stacktrace
 
-      - name: Verify APK exists and contains the native game library
+      - name: Verify APK exists and every native library is 32-bit ARM
         run: |
           APK=android-base/app/build/outputs/apk/debug/app-debug.apk
           test -f "$APK" || { echo "::error::APK not found at $APK"; exit 1; }
           ls -l "$APK"
           test "$(stat -c %s "$APK")" -gt 1000000 || { echo "::error::APK suspiciously small"; exit 1; }
-          unzip -l "$APK" | grep -E "lib/$ABI/(libmain|libSDL2)\.so"
+          unzip -l "$APK" | grep -E "lib/$ABI/(libmain|libSDL2)\\.so"
+          libs=$(unzip -Z1 "$APK" | grep -E '^lib/.*\.so$' || true)
+          test -n "$libs" || { echo "::error::no native libraries in APK"; exit 1; }
+          if echo "$libs" | grep -qv "^lib/$ABI/"; then
+            echo "::error::APK contains native libraries for other ABIs:"; echo "$libs"; exit 1
+          fi
+          rm -rf apk-libs && mkdir apk-libs
+          unzip -q -o "$APK" 'lib/*' -d apk-libs
+          fail=0
+          for so in $(find apk-libs -name '*.so' | sort); do
+            hdr=$(readelf -h "$so")
+            cls=$(echo "$hdr" | sed -n 's/^ *Class: *//p')
+            mach=$(echo "$hdr" | sed -n 's/^ *Machine: *//p')
+            echo "$so -> class=[$cls] machine=[$mach]"
+            readelf -A "$so" | grep -E "Tag_CPU_arch:" || true
+            if [ "$cls" != "ELF32" ] || [ "$mach" != "ARM" ]; then
+              echo "::error::$so is not 32-bit ARM"; fail=1
+            fi
+          done
+          if [ "$fail" -ne 0 ]; then exit 1; fi
           mkdir -p dist
-          cp "$APK" dist/sm64-bob-debug.apk
-          sha256sum dist/sm64-bob-debug.apk
+          cp "$APK" dist/sm64-bob-debug-armv7.apk
+          sha256sum dist/sm64-bob-debug-armv7.apk
 
       - name: Upload APK artifact
         uses: actions/upload-artifact@v4
         with:
-          name: sm64-bob-debug-apk
-          path: dist/sm64-bob-debug.apk
+          name: sm64-bob-debug-armv7-apk
+          path: dist/sm64-bob-debug-armv7.apk
           if-no-files-found: error
           retention-days: 7
 
