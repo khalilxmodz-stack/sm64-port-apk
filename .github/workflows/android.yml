@@ -135,10 +135,17 @@ jobs:
                   deadline = now; /* first frame or a stall: resync, never fast-forward */
               }
               if (now < deadline) {
-                  Uint64 ms = ((deadline - now) * 1000) / freq;
-                  if (ms > 2) SDL_Delay((Uint32)(ms - 2));
-                  while (SDL_GetPerformanceCounter() < deadline) { }
+                  /* Avoid a CPU-burning busy-wait on low-end Android devices.
+                     SDL_Delay yields the CPU; a tiny timing overshoot is safer
+                     than keeping one core busy while the game is already slow. */
+                  Uint64 remaining = deadline - now;
+                  Uint64 ms = (remaining * 1000) / freq;
+                  if (ms > 0) SDL_Delay((Uint32)ms);
+                  now = SDL_GetPerformanceCounter();
               }
+              /* If rendering missed the deadline, resync instead of trying to
+                 catch up by running frames too quickly. */
+              if (now > deadline + step) deadline = now;
               deadline += step;
           #ifdef __ANDROID__
               {
@@ -354,7 +361,7 @@ jobs:
           grep -q "^ *abiFilters '$ABI'\$" app/build.gradle || { echo "::error::abiFilters was not rewritten to $ABI"; exit 1; }
           grep -q "^APP_ABI := $ABI\$" app/jni/Application.mk || { echo "::error::APP_ABI was not rewritten to $ABI"; exit 1; }
 
-      - name: Optimize native build (release flags instead of debug)
+      - name: Optimize native build for low-end Android (release native flags)
         working-directory: android-base
         run: |
           python3 - <<'PY'
@@ -495,7 +502,7 @@ jobs:
 
               private static TextView bar;
               private static boolean showStats = true;
-              private static int scaleIdx = 2;
+              private static int scaleIdx = 3;
               private static String fps = "--";
               private static String ms = "--";
               private static int renderW = 0;
@@ -514,9 +521,9 @@ jobs:
               private static void doAttach(final Activity act, final View surface, final ViewGroup layout) {
                   final SharedPreferences prefs = act.getSharedPreferences("sm64_overlay", 0);
                   showStats = prefs.getBoolean("stats", true);
-                  scaleIdx = prefs.getInt("scale", 2);
+                  scaleIdx = prefs.getInt("scale", 3);
                   if (scaleIdx < 0 || scaleIdx >= SCALES.length) {
-                      scaleIdx = 2;
+                      scaleIdx = 3;
                   }
 
                   FrameLayout root = new FrameLayout(act);
@@ -635,7 +642,7 @@ jobs:
               private static void showMenu(final Activity act, final View surface, final SharedPreferences prefs) {
                   StringBuilder sb = new StringBuilder();
                   sb.append("FPS: ").append(fps).append("  (").append(ms).append(" ms/frame)\n");
-                  sb.append("Frame limit: 30 FPS (original game speed)\n");
+                  sb.append("Target frame rate: 30 FPS; actual FPS depends on device\n");
                   sb.append("Render resolution: ").append(renderW).append("x").append(renderH).append("\n");
                   sb.append("Screen: ").append(surface.getWidth()).append("x").append(surface.getHeight()).append("\n");
                   sb.append("Display refresh: ").append(act.getWindowManager().getDefaultDisplay().getRefreshRate()).append(" Hz\n");
@@ -737,7 +744,9 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: build-logs
-          path: native-make.log
+          path: |
+            native-make.log
+            patch-report.txt
           if-no-files-found: ignore
           retention-days: 7
 
