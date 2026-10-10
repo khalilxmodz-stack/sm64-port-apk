@@ -92,6 +92,143 @@ jobs:
           print("BoB boot patch applied")
           PY
 
+      - name: Patch FPS limiter + black translucent touch buttons
+        working-directory: android-base/app/jni/src
+        run: |
+          python3 -m pip install -q pillow || python3 -m pip install -q --break-system-packages pillow || true
+          python3 - <<'PY'
+          import glob, os, re
+
+          report = []
+          def log(m):
+              print(m, flush=True)
+              report.append(m)
+
+          # =====================================================
+          # 1) Speed fix: hard-lock the game to 30 FPS.
+          #    Without a limiter the game logic runs once per
+          #    displayed frame, so a 60/90/120 Hz phone plays it
+          #    2x/3x/4x too fast.
+          # =====================================================
+          LIMITER = """/* ---- injected: hard 30 FPS limiter ---- */
+          static void injected_limit_30fps(void) {
+              static Uint64 deadline = 0;
+              const Uint64 freq = SDL_GetPerformanceFrequency();
+              const Uint64 step = freq / 30;
+              Uint64 now = SDL_GetPerformanceCounter();
+              if (deadline == 0 || now > deadline + step) {
+                  deadline = now; /* first frame or a stall: resync, never fast-forward */
+              }
+              if (now < deadline) {
+                  Uint64 ms = ((deadline - now) * 1000) / freq;
+                  if (ms > 2) SDL_Delay((Uint32)(ms - 2));
+                  while (SDL_GetPerformanceCounter() < deadline) { }
+              }
+              deadline += step;
+          }
+          """.replace("\n          ", "\n")
+
+          try:
+              pat = re.compile(r'static\s+void\s+gfx_sdl_swap_buffers_begin\s*\(\s*(?:void)?\s*\)\s*\{')
+              done = 0
+              for p in sorted(glob.glob('src/pc/**/*.c', recursive=True)):
+                  s = open(p, encoding='utf-8', errors='replace').read()
+                  if 'injected_limit_30fps' in s:
+                      continue
+                  m = pat.search(s)
+                  if not m:
+                      continue
+                  s = (s[:m.start()] + LIMITER + "\n" + s[m.start():m.end()]
+                       + "\n    injected_limit_30fps();\n" + s[m.end():])
+                  open(p, 'w', encoding='utf-8').write(s)
+                  log("FPS: limiter injected into " + p)
+                  done += 1
+              if not done:
+                  log("FPS WARNING: gfx_sdl_swap_buffers_begin not found - limiter NOT applied")
+          except Exception as e:
+              log("FPS ERROR: %r" % (e,))
+
+          # =====================================================
+          # 2) Touch buttons: black + translucent
+          #    a) recolor the button textures to (almost) black
+          #       (alpha shape is kept)
+          #    b) force a low alpha on the colors the touch
+          #       controller code sets
+          # =====================================================
+          TOUCH_ALPHA = 110      # 0 = invisible ... 255 = solid
+          DARKEN = 0.12          # 0 = pure black, 1 = unchanged
+
+          try:
+              from PIL import Image
+              files = sorted(glob.glob('textures/touchcontrols/*.png'))
+              if not files:
+                  log("TOUCH WARNING: no textures/touchcontrols/*.png found")
+              for p in files:
+                  name = os.path.basename(p).lower()
+                  if not re.search(r'button|joy|stick|dpad|circle|pad', name):
+                      log("TOUCH: texture left untouched: " + p)
+                      continue
+                  im = Image.open(p).convert('RGBA')
+                  r, g, b, a = im.split()
+                  f = lambda v: int(v * DARKEN)
+                  Image.merge('RGBA', (r.point(f), g.point(f), b.point(f), a)).save(p)
+                  log("TOUCH: texture darkened: " + p)
+          except Exception as e:
+              log("TOUCH texture step skipped: %r" % (e,))
+
+          def split_args(s):
+              out, depth, cur = [], 0, ''
+              for ch in s:
+                  if ch == ',' and depth == 0:
+                      out.append(cur); cur = ''
+                  else:
+                      if ch in '([': depth += 1
+                      elif ch in ')]': depth -= 1
+                      cur += ch
+              out.append(cur)
+              return out
+
+          def patch_alpha(src):
+              rx = re.compile(r'\bgDPSet(Env|Prim)Color\s*\(')
+              out, i, n = [], 0, 0
+              while True:
+                  m = rx.search(src, i)
+                  if not m:
+                      out.append(src[i:])
+                      break
+                  j, depth = m.end(), 1
+                  while j < len(src) and depth:
+                      if src[j] == '(': depth += 1
+                      elif src[j] == ')': depth -= 1
+                      j += 1
+                  args = split_args(src[m.end():j - 1])
+                  need = 5 if m.group(1) == 'Env' else 7
+                  if len(args) == need and args[-1].strip() != '0':
+                      args[-1] = ' %d' % TOUCH_ALPHA
+                      out.append(src[i:m.end()] + ','.join(args) + ')')
+                      n += 1
+                  else:
+                      out.append(src[i:j])
+                  i = j
+              return ''.join(out), n
+
+          try:
+              touch_c = [p for p in sorted(glob.glob('src/pc/**/*.c', recursive=True))
+                         if 'touch' in os.path.basename(p).lower()]
+              if not touch_c:
+                  log("TOUCH WARNING: no *touch*.c file under src/pc")
+              for p in touch_c:
+                  s = open(p, encoding='utf-8', errors='replace').read()
+                  s2, n = patch_alpha(s)
+                  if n:
+                      open(p, 'w', encoding='utf-8').write(s2)
+                  log("TOUCH: %s -> %d color call(s) set to alpha %d" % (p, n, TOUCH_ALPHA))
+          except Exception as e:
+              log("TOUCH alpha step skipped: %r" % (e,))
+
+          open('../../../../patch-report.txt', 'w').write("\n".join(report) + "\n")
+          PY
+
       - name: Install native build dependencies
         run: |
           sudo apt-get update
@@ -224,5 +361,23 @@ jobs:
         with:
           name: build-logs
           path: native-make.log
+          if-no-files-found: ignore
+          retention-days: 7
+
+      - name: Collect source files for diagnosis
+        if: always()
+        run: |
+          mkdir -p diag
+          S=android-base/app/jni/src
+          find "$S/src/pc" -maxdepth 2 -type f \( -iname '*touch*' -o -name 'gfx_sdl*.c' -o -name 'pc_main.c' \) -exec cp {} diag/ \; 2>/dev/null || true
+          ls "$S/textures/touchcontrols" > diag/touch-textures.txt 2>&1 || true
+          cp patch-report.txt diag/ 2>/dev/null || true
+
+      - name: Upload diagnosis files (also on failure)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: source-diag
+          path: diag
           if-no-files-found: ignore
           retention-days: 7
