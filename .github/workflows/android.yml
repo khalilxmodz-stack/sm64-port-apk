@@ -92,7 +92,7 @@ jobs:
           print("BoB boot patch applied")
           PY
 
-      - name: Patch FPS limiter + black translucent touch buttons
+      - name: Patch FPS limiter + vsync + black translucent touch buttons
         working-directory: android-base/app/jni/src
         run: |
           python3 -m pip install -q pillow || python3 -m pip install -q --break-system-packages pillow || true
@@ -110,7 +110,22 @@ jobs:
           #    displayed frame, so a 60/90/120 Hz phone plays it
           #    2x/3x/4x too fast.
           # =====================================================
-          LIMITER = """/* ---- injected: hard 30 FPS limiter ---- */
+          LIMITER = """/* ---- injected: hard 30 FPS limiter + stats for the in-game menu ---- */
+          #ifdef __ANDROID__
+          #include <stdio.h>
+          static void injected_write_stats(float fps, float ms) {
+              const char *dir = SDL_AndroidGetInternalStoragePath();
+              char path[512];
+              int w = 0, h = 0;
+              FILE *f;
+              SDL_Window *win = SDL_GL_GetCurrentWindow();
+              if (!dir) return;
+              if (win) SDL_GL_GetDrawableSize(win, &w, &h);
+              snprintf(path, sizeof(path), "%s/sm64_stats.txt", dir);
+              f = fopen(path, "w");
+              if (f) { fprintf(f, "fps=%.1f ms=%.1f w=%d h=%d\\n", fps, ms, w, h); fclose(f); }
+          }
+          #endif
           static void injected_limit_30fps(void) {
               static Uint64 deadline = 0;
               const Uint64 freq = SDL_GetPerformanceFrequency();
@@ -125,8 +140,23 @@ jobs:
                   while (SDL_GetPerformanceCounter() < deadline) { }
               }
               deadline += step;
+          #ifdef __ANDROID__
+              {
+                  static Uint64 stat_start = 0;
+                  static int stat_frames = 0;
+                  Uint64 t = SDL_GetPerformanceCounter();
+                  if (stat_start == 0) stat_start = t;
+                  stat_frames++;
+                  if (t - stat_start >= freq) {
+                      double secs = (double)(t - stat_start) / (double)freq;
+                      injected_write_stats((float)(stat_frames / secs), (float)(secs * 1000.0 / stat_frames));
+                      stat_start = t;
+                      stat_frames = 0;
+                  }
+              }
+          #endif
           }
-          """.replace("\n          ", "\n")
+          """
 
           try:
               pat = re.compile(r'static\s+void\s+gfx_sdl_swap_buffers_begin\s*\(\s*(?:void)?\s*\)\s*\{')
@@ -147,6 +177,19 @@ jobs:
                   log("FPS WARNING: gfx_sdl_swap_buffers_begin not found - limiter NOT applied")
           except Exception as e:
               log("FPS ERROR: %r" % (e,))
+
+          # ---- vsync off: our own limiter paces the game; with vsync on, a slow
+          #      device is rounded down (e.g. 40 ms -> 50 ms = 20 FPS instead of 25) ----
+          try:
+              rx = re.compile(r'SDL_GL_SetSwapInterval\s*\([^;]*\)')
+              for p in sorted(glob.glob('src/pc/**/*.c', recursive=True)):
+                  s = open(p, encoding='utf-8', errors='replace').read()
+                  s2 = rx.sub('SDL_GL_SetSwapInterval(0)', s)
+                  if s2 != s:
+                      open(p, 'w', encoding='utf-8').write(s2)
+                      log("FPS: vsync disabled in " + p)
+          except Exception as e:
+              log("FPS vsync step skipped: %r" % (e,))
 
           # =====================================================
           # 2) Touch buttons: black + translucent
@@ -311,11 +354,345 @@ jobs:
           grep -q "^ *abiFilters '$ABI'\$" app/build.gradle || { echo "::error::abiFilters was not rewritten to $ABI"; exit 1; }
           grep -q "^APP_ABI := $ABI\$" app/jni/Application.mk || { echo "::error::APP_ABI was not rewritten to $ABI"; exit 1; }
 
+      - name: Optimize native build (release flags instead of debug)
+        working-directory: android-base
+        run: |
+          python3 - <<'PY'
+          import re
+          report = open('../patch-report.txt', 'a')
+          def log(m):
+              print(m, flush=True)
+              report.write(m + "\n")
+
+          # 1) Application.mk: force optimized native code (debug builds are -O0 = very slow)
+          p = 'app/jni/Application.mk'
+          s = open(p).read()
+          s = re.sub(r'(?m)^\s*APP_OPTIM\s*[:+?]?=.*\n?', '', s)
+          s = s.rstrip('\n') + '\nAPP_OPTIM := release\n'
+          open(p, 'w').write(s)
+          log("OPT: APP_OPTIM := release in " + p)
+
+          # 2) Gradle: do not ask ndk-build for a debuggable (NDK_DEBUG=1) build
+          p = 'app/build.gradle'
+          g = open(p).read()
+          if 'jniDebuggable' in g:
+              log("OPT: build.gradle already has jniDebuggable - left alone")
+          else:
+              ins = "\n        debug {\n            jniDebuggable false\n        }\n"
+              m = re.search(r'buildTypes\s*\{', g)
+              if m:
+                  g = g[:m.end()] + ins + g[m.end():]
+              else:
+                  m = re.search(r'\bandroid\s*\{', g)
+                  if m:
+                      g = g[:m.end()] + "\n    buildTypes {" + ins + "    }\n" + g[m.end():]
+              if 'jniDebuggable' in g:
+                  open(p, 'w').write(g)
+                  log("OPT: jniDebuggable false added to " + p)
+              else:
+                  log("OPT WARNING: could not edit build.gradle")
+
+          # 3) game Android.mk: -O3 and ARM (not Thumb) code
+          p = 'app/jni/src/Android.mk'
+          s = open(p).read()
+          s = re.sub(r'-O0\b', '-O3', s)
+          line = "LOCAL_ARM_MODE := arm\nLOCAL_CFLAGS += -O3\n"
+          rx = re.compile(r'(?m)^\s*include\s+\$\(BUILD_SHARED_LIBRARY\)')
+          if 'LOCAL_ARM_MODE := arm' not in s and rx.search(s):
+              m = rx.search(s)
+              s = s[:m.start()] + line + s[m.start():]
+              log("OPT: -O3 + ARM mode added to " + p)
+          else:
+              log("OPT WARNING: BUILD_SHARED_LIBRARY line not found in " + p)
+          open(p, 'w').write(s)
+          PY
+          echo "---- flags currently in the makefiles ----"
+          grep -n -E "APP_OPTIM|APP_CFLAGS|LOCAL_CFLAGS|LOCAL_ARM|-O[0-3s]|jniDebuggable" app/jni/Application.mk app/jni/src/Android.mk app/build.gradle || true
+
+      - name: Add in-game stats overlay + menu (FPS, resolution, render scale)
+        run: |
+          python3 - <<'PY'
+          import glob, os, re, shutil
+
+          report = open('patch-report.txt', 'a')
+          def log(m):
+              print(m, flush=True)
+              report.write(m + "\n")
+
+          BASE = 'android-base'
+          acts = sorted(glob.glob(BASE + '/app/src/**/SDLActivity.java', recursive=True))
+          if not acts:
+              log("OVERLAY: SDLActivity.java not found - menu skipped")
+              raise SystemExit(0)
+          act_path = acts[0]
+          pkgdir = os.path.dirname(act_path)
+          act_src = open(act_path, encoding='utf-8').read()
+          pkg = re.search(r'(?m)^\s*package\s+([\w.]+)\s*;', act_src).group(1)
+
+          if not re.search(r'setContentView\(\s*mLayout\s*\)\s*;', act_src):
+              log("OVERLAY: 'setContentView(mLayout);' not found - menu skipped")
+              raise SystemExit(0)
+
+          os.makedirs('overlay-backup', exist_ok=True)
+          def backup(path):
+              rel = os.path.relpath(path, BASE)
+              dst = os.path.join('overlay-backup', rel)
+              os.makedirs(os.path.dirname(dst), exist_ok=True)
+              if not os.path.exists(dst):
+                  shutil.copy(path, dst)
+
+          # --- touch fix: with a smaller render buffer SDL must still normalise
+          #     finger positions by the REAL view size, otherwise touch breaks ---
+          nx = ny = 0
+          for jp in sorted(glob.glob(pkgdir + '/*.java')):
+              s = open(jp, encoding='utf-8').read()
+              s2, a = re.subn(r'(\.getX\(\s*\w*\s*\))\s*/\s*mWidth\b', r'\1 / (float) getWidth()', s)
+              s2, b = re.subn(r'(\.getY\(\s*\w*\s*\))\s*/\s*mHeight\b', r'\1 / (float) getHeight()', s2)
+              if a or b:
+                  backup(jp)
+                  open(jp, 'w', encoding='utf-8').write(s2)
+                  log("OVERLAY: touch normalisation patched in %s (x:%d y:%d)" % (jp, a, b))
+              nx += a; ny += b
+          scale_ok = (nx > 0 and ny > 0)
+          if not scale_ok:
+              log("OVERLAY: touch normalisation not found - render-scale option disabled")
+
+          # --- hook into SDLActivity.onCreate ---
+          backup(act_path)
+          act_src = open(act_path, encoding='utf-8').read()
+          act_src = re.sub(r'(setContentView\(\s*mLayout\s*\)\s*;)',
+                           r'\1\n        SM64Overlay.attach(this, mSurface, mLayout);',
+                           act_src, count=1)
+          open(act_path, 'w', encoding='utf-8').write(act_src)
+
+          JAVA = r"""package @@PKG@@;
+
+          import android.app.Activity;
+          import android.app.AlertDialog;
+          import android.content.DialogInterface;
+          import android.content.SharedPreferences;
+          import android.graphics.Color;
+          import android.os.Build;
+          import android.os.Handler;
+          import android.os.Looper;
+          import android.util.Log;
+          import android.view.Gravity;
+          import android.view.SurfaceView;
+          import android.view.View;
+          import android.view.ViewGroup;
+          import android.widget.FrameLayout;
+          import android.widget.TextView;
+
+          import java.io.BufferedReader;
+          import java.io.File;
+          import java.io.FileReader;
+
+          /** Small on-screen FPS / resolution bar + menu. Injected at build time. */
+          public class SM64Overlay {
+              static final boolean SCALE_OK = @@SCALE@@;
+              private static final int[] SCALES = {100, 75, 60, 50, 40};
+              private static final String TAG = "SM64Overlay";
+
+              private static TextView bar;
+              private static boolean showStats = true;
+              private static int scaleIdx = 2;
+              private static String fps = "--";
+              private static String ms = "--";
+              private static int renderW = 0;
+              private static int renderH = 0;
+              private static int viewW = 0;
+              private static int viewH = 0;
+
+              public static void attach(final Activity act, final View surface, final ViewGroup layout) {
+                  try {
+                      doAttach(act, surface, layout);
+                  } catch (Throwable t) {
+                      Log.e(TAG, "overlay disabled", t);
+                  }
+              }
+
+              private static void doAttach(final Activity act, final View surface, final ViewGroup layout) {
+                  final SharedPreferences prefs = act.getSharedPreferences("sm64_overlay", 0);
+                  showStats = prefs.getBoolean("stats", true);
+                  scaleIdx = prefs.getInt("scale", 2);
+                  if (scaleIdx < 0 || scaleIdx >= SCALES.length) {
+                      scaleIdx = 2;
+                  }
+
+                  FrameLayout root = new FrameLayout(act);
+                  bar = new TextView(act);
+                  bar.setTextColor(Color.WHITE);
+                  bar.setTextSize(11);
+                  bar.setPadding(14, 6, 14, 6);
+                  bar.setBackgroundColor(Color.argb(110, 0, 0, 0));
+                  bar.setOnClickListener(new View.OnClickListener() {
+                      public void onClick(View v) {
+                          showMenu(act, surface, prefs);
+                      }
+                  });
+                  FrameLayout.LayoutParams lp = new FrameLayout.LayoutParams(
+                          ViewGroup.LayoutParams.WRAP_CONTENT,
+                          ViewGroup.LayoutParams.WRAP_CONTENT,
+                          Gravity.BOTTOM | Gravity.CENTER_HORIZONTAL);
+                  root.addView(bar, lp);
+                  updateBar();
+                  layout.addView(root, new ViewGroup.LayoutParams(
+                          ViewGroup.LayoutParams.MATCH_PARENT,
+                          ViewGroup.LayoutParams.MATCH_PARENT));
+
+                  if (SCALE_OK) {
+                      surface.addOnLayoutChangeListener(new View.OnLayoutChangeListener() {
+                          public void onLayoutChange(View v, int left, int top, int right, int bottom,
+                                                     int oldLeft, int oldTop, int oldRight, int oldBottom) {
+                              int w = right - left;
+                              int h = bottom - top;
+                              if (w != viewW || h != viewH) {
+                                  viewW = w;
+                                  viewH = h;
+                                  applyScale(v);
+                              }
+                          }
+                      });
+                  }
+
+                  final Handler handler = new Handler(Looper.getMainLooper());
+                  final File statsFile = new File(act.getFilesDir(), "sm64_stats.txt");
+                  handler.post(new Runnable() {
+                      public void run() {
+                          readStats(statsFile);
+                          updateBar();
+                          handler.postDelayed(this, 500);
+                      }
+                  });
+              }
+
+              private static void applyScale(View surface) {
+                  if (!SCALE_OK || !(surface instanceof SurfaceView)) {
+                      return;
+                  }
+                  int w = surface.getWidth();
+                  int h = surface.getHeight();
+                  if (w <= 0 || h <= 0) {
+                      return;
+                  }
+                  int pct = SCALES[scaleIdx];
+                  SurfaceView sv = (SurfaceView) surface;
+                  if (pct >= 100) {
+                      sv.getHolder().setSizeFromLayout();
+                  } else {
+                      sv.getHolder().setFixedSize(Math.max(320, w * pct / 100), Math.max(180, h * pct / 100));
+                  }
+              }
+
+              private static void readStats(File f) {
+                  BufferedReader br = null;
+                  try {
+                      br = new BufferedReader(new FileReader(f));
+                      String line = br.readLine();
+                      if (line == null) {
+                          return;
+                      }
+                      String[] parts = line.trim().split(" ");
+                      for (int i = 0; i < parts.length; i++) {
+                          String[] kv = parts[i].split("=");
+                          if (kv.length != 2) {
+                              continue;
+                          }
+                          if (kv[0].equals("fps")) {
+                              fps = kv[1];
+                          } else if (kv[0].equals("ms")) {
+                              ms = kv[1];
+                          } else if (kv[0].equals("w")) {
+                              renderW = Integer.parseInt(kv[1]);
+                          } else if (kv[0].equals("h")) {
+                              renderH = Integer.parseInt(kv[1]);
+                          }
+                      }
+                  } catch (Throwable t) {
+                      // not written yet or being rewritten: keep the old values
+                  } finally {
+                      try {
+                          if (br != null) {
+                              br.close();
+                          }
+                      } catch (Throwable t2) {
+                          // ignore
+                      }
+                  }
+              }
+
+              private static void updateBar() {
+                  if (bar == null) {
+                      return;
+                  }
+                  if (showStats) {
+                      bar.setText("FPS " + fps + "  |  " + renderW + "x" + renderH + "  |  MENU");
+                  } else {
+                      bar.setText("MENU");
+                  }
+              }
+
+              private static void showMenu(final Activity act, final View surface, final SharedPreferences prefs) {
+                  StringBuilder sb = new StringBuilder();
+                  sb.append("FPS: ").append(fps).append("  (").append(ms).append(" ms/frame)\n");
+                  sb.append("Frame limit: 30 FPS (original game speed)\n");
+                  sb.append("Render resolution: ").append(renderW).append("x").append(renderH).append("\n");
+                  sb.append("Screen: ").append(surface.getWidth()).append("x").append(surface.getHeight()).append("\n");
+                  sb.append("Display refresh: ").append(act.getWindowManager().getDefaultDisplay().getRefreshRate()).append(" Hz\n");
+                  if (SCALE_OK) {
+                      sb.append("Render scale: ").append(SCALES[scaleIdx]).append("%\n");
+                  }
+                  sb.append("Device: ").append(Build.MANUFACTURER).append(" ").append(Build.MODEL).append("\n");
+                  sb.append("Android ").append(Build.VERSION.RELEASE).append(" (API ").append(Build.VERSION.SDK_INT).append(")\n");
+                  sb.append("CPU ABI: ").append(Build.CPU_ABI);
+
+                  AlertDialog.Builder b = new AlertDialog.Builder(act);
+                  b.setTitle("SM64 Info");
+                  b.setMessage(sb.toString());
+                  b.setPositiveButton(showStats ? "Hide stats" : "Show stats", new DialogInterface.OnClickListener() {
+                      public void onClick(DialogInterface d, int which) {
+                          showStats = !showStats;
+                          prefs.edit().putBoolean("stats", showStats).apply();
+                          updateBar();
+                      }
+                  });
+                  if (SCALE_OK) {
+                      b.setNegativeButton("Scale " + SCALES[scaleIdx] + "% (change)", new DialogInterface.OnClickListener() {
+                          public void onClick(DialogInterface d, int which) {
+                              scaleIdx = (scaleIdx + 1) % SCALES.length;
+                              prefs.edit().putInt("scale", scaleIdx).apply();
+                              applyScale(surface);
+                          }
+                      });
+                  }
+                  b.setNeutralButton("Close", null);
+                  b.show();
+              }
+          }
+          """
+          # remove the YAML-induced indentation is already done by YAML; fill the tokens
+          JAVA = JAVA.replace('@@PKG@@', pkg).replace('@@SCALE@@', 'true' if scale_ok else 'false')
+          out = os.path.join(pkgdir, 'SM64Overlay.java')
+          open(out, 'w', encoding='utf-8').write(JAVA)
+          open('overlay-created.txt', 'w').write(out + "\n")
+          log("OVERLAY: SM64Overlay.java created in " + pkgdir + " (scale option: %s)" % scale_ok)
+          PY
+
       - name: Build debug APK
         working-directory: android-base
         run: |
           chmod +x gradlew
-          ./gradlew assembleDebug --no-daemon --stacktrace
+          if ! ./gradlew assembleDebug --no-daemon --stacktrace; then
+            echo "::warning::Build failed. Retrying WITHOUT the Java overlay/menu patch."
+            if [ -d ../overlay-backup ]; then
+              cp -r ../overlay-backup/. .
+              if [ -f ../overlay-created.txt ]; then rm -f $(sed 's#^android-base/##' ../overlay-created.txt); fi
+              echo "OVERLAY: DISABLED (Java compile failed, retried without it)" >> ../patch-report.txt
+              ./gradlew assembleDebug --no-daemon --stacktrace
+            else
+              exit 1
+            fi
+          fi
 
       - name: Verify APK exists and every native library is 32-bit ARM
         run: |
@@ -370,6 +747,10 @@ jobs:
           mkdir -p diag
           S=android-base/app/jni/src
           find "$S/src/pc" -maxdepth 2 -type f \( -iname '*touch*' -o -name 'gfx_sdl*.c' -o -name 'pc_main.c' \) -exec cp {} diag/ \; 2>/dev/null || true
+          find android-base/app/src -name 'SDLActivity.java' -o -name 'SM64Overlay.java' | while read f; do cp "$f" diag/; done
+          cp android-base/app/build.gradle diag/build.gradle.txt 2>/dev/null || true
+          cp android-base/app/jni/Application.mk diag/Application.mk.txt 2>/dev/null || true
+          cp "$S/Android.mk" diag/src-Android.mk.txt 2>/dev/null || true
           ls "$S/textures/touchcontrols" > diag/touch-textures.txt 2>&1 || true
           cp patch-report.txt diag/ 2>/dev/null || true
 
