@@ -5,6 +5,8 @@ name: Build SM64 Bob-omb Battlefield APK
 #   3) native `make` in app/jni/src (extracts assets, generates C sources)
 #   4) ./gradlew assembleDebug (ndk-build through app/jni/Android.mk)
 # Written without being able to run it. If a step fails, read that step's log.
+# Game changes (level select screen, touch UI, 30 Hz pacing) are applied by the
+# 'Apply level-select...' step, after the host asset build.
 
 on:
   workflow_dispatch:
@@ -52,232 +54,6 @@ jobs:
           git -C android-base/app/jni/src checkout "$GAME_SHA"
           git -C android-base rev-parse HEAD
           git -C android-base/app/jni/src rev-parse HEAD
-
-      - name: Patch game to boot straight into Bob-omb Battlefield
-        working-directory: android-base/app/jni/src
-        run: |
-          python3 - <<'PY'
-          # Minimal source edits so the game boots directly into Bob-omb Battlefield.
-          def patch(path, old, new):
-              s = open(path).read()
-              assert s.count(old) == 1, "anchor not found exactly once in " + path
-              open(path, "w").write(s.replace(old, new))
-
-          # 1) levels/scripts.c: replace the "menu -> level" loop with a direct BoB start
-          old = "\n".join([
-              "    CALL(/*arg*/ 0, /*func*/ lvl_init_from_save_file),",
-              "    LOOP_BEGIN(),",
-              "        EXECUTE(/*seg*/ 0x14, _menuSegmentRomStart, _menuSegmentRomEnd, level_main_menu_entry_2),",
-              "        JUMP_LINK(script_exec_level_table),",
-              "        SLEEP(/*frames*/ 1),",
-              "    LOOP_UNTIL(/*op*/ OP_LT, /*arg*/ 0),",
-              ""])
-          new = "\n".join([
-              "    SET_REG(/*value*/ LEVEL_BOB),",
-              "    CALL(/*arg*/ 0, /*func*/ lvl_init_from_save_file),",
-              "    CALL(/*arg*/ 0, /*func*/ lvl_set_current_level),",
-              "    SET_REG(/*value*/ 1),",
-              "    GET_OR_SET(/*op*/ OP_SET, /*var*/ VAR_CURR_ACT_NUM),",
-              "    LOOP_BEGIN(),",
-              "        JUMP_LINK(script_exec_level_table),",
-              "        SLEEP(/*frames*/ 1),",
-              "    LOOP_UNTIL(/*op*/ OP_LT, /*arg*/ 0),",
-              ""])
-          patch("levels/scripts.c", old, new)
-
-          # 2) src/game/level_update.c: no castle-grounds intro cutscene on a fresh save
-          old = "                    if (save_file_exists(gCurrSaveFileNum - 1)) {\n                        set_mario_action(gMarioState, ACT_IDLE, 0);"
-          new = "                    if (TRUE) {\n                        set_mario_action(gMarioState, ACT_IDLE, 0);"
-          patch("src/game/level_update.c", old, new)
-          print("BoB boot patch applied")
-          PY
-
-      - name: Patch FPS limiter + vsync + black translucent touch buttons
-        working-directory: android-base/app/jni/src
-        run: |
-          python3 -m pip install -q pillow || python3 -m pip install -q --break-system-packages pillow || true
-          python3 - <<'PY'
-          import glob, os, re
-
-          report = []
-          def log(m):
-              print(m, flush=True)
-              report.append(m)
-
-          # =====================================================
-          # 1) Speed fix: hard-lock the game to 30 FPS.
-          #    Without a limiter the game logic runs once per
-          #    displayed frame, so a 60/90/120 Hz phone plays it
-          #    2x/3x/4x too fast.
-          # =====================================================
-          LIMITER = """/* ---- injected: hard 30 FPS limiter + stats for the in-game menu ---- */
-          #ifdef __ANDROID__
-          #include <stdio.h>
-          static void injected_write_stats(float fps, float ms) {
-              const char *dir = SDL_AndroidGetInternalStoragePath();
-              char path[512];
-              int w = 0, h = 0;
-              FILE *f;
-              SDL_Window *win = SDL_GL_GetCurrentWindow();
-              if (!dir) return;
-              if (win) SDL_GL_GetDrawableSize(win, &w, &h);
-              snprintf(path, sizeof(path), "%s/sm64_stats.txt", dir);
-              f = fopen(path, "w");
-              if (f) { fprintf(f, "fps=%.1f ms=%.1f w=%d h=%d\\n", fps, ms, w, h); fclose(f); }
-          }
-          #endif
-          static void injected_limit_30fps(void) {
-              static Uint64 deadline = 0;
-              const Uint64 freq = SDL_GetPerformanceFrequency();
-              const Uint64 step = freq / 30;
-              Uint64 now = SDL_GetPerformanceCounter();
-              if (deadline == 0 || now > deadline + step) {
-                  deadline = now; /* first frame or a stall: resync, never fast-forward */
-              }
-              if (now < deadline) {
-                  /* Avoid a CPU-burning busy-wait on low-end Android devices.
-                     SDL_Delay yields the CPU; a tiny timing overshoot is safer
-                     than keeping one core busy while the game is already slow. */
-                  Uint64 remaining = deadline - now;
-                  Uint64 ms = (remaining * 1000) / freq;
-                  if (ms > 0) SDL_Delay((Uint32)ms);
-                  now = SDL_GetPerformanceCounter();
-              }
-              /* If rendering missed the deadline, resync instead of trying to
-                 catch up by running frames too quickly. */
-              if (now > deadline + step) deadline = now;
-              deadline += step;
-          #ifdef __ANDROID__
-              {
-                  static Uint64 stat_start = 0;
-                  static int stat_frames = 0;
-                  Uint64 t = SDL_GetPerformanceCounter();
-                  if (stat_start == 0) stat_start = t;
-                  stat_frames++;
-                  if (t - stat_start >= freq) {
-                      double secs = (double)(t - stat_start) / (double)freq;
-                      injected_write_stats((float)(stat_frames / secs), (float)(secs * 1000.0 / stat_frames));
-                      stat_start = t;
-                      stat_frames = 0;
-                  }
-              }
-          #endif
-          }
-          """
-
-          try:
-              pat = re.compile(r'static\s+void\s+gfx_sdl_swap_buffers_begin\s*\(\s*(?:void)?\s*\)\s*\{')
-              done = 0
-              for p in sorted(glob.glob('src/pc/**/*.c', recursive=True)):
-                  s = open(p, encoding='utf-8', errors='replace').read()
-                  if 'injected_limit_30fps' in s:
-                      continue
-                  m = pat.search(s)
-                  if not m:
-                      continue
-                  s = (s[:m.start()] + LIMITER + "\n" + s[m.start():m.end()]
-                       + "\n    injected_limit_30fps();\n" + s[m.end():])
-                  open(p, 'w', encoding='utf-8').write(s)
-                  log("FPS: limiter injected into " + p)
-                  done += 1
-              if not done:
-                  log("FPS WARNING: gfx_sdl_swap_buffers_begin not found - limiter NOT applied")
-          except Exception as e:
-              log("FPS ERROR: %r" % (e,))
-
-          # ---- vsync off: our own limiter paces the game; with vsync on, a slow
-          #      device is rounded down (e.g. 40 ms -> 50 ms = 20 FPS instead of 25) ----
-          try:
-              rx = re.compile(r'SDL_GL_SetSwapInterval\s*\([^;]*\)')
-              for p in sorted(glob.glob('src/pc/**/*.c', recursive=True)):
-                  s = open(p, encoding='utf-8', errors='replace').read()
-                  s2 = rx.sub('SDL_GL_SetSwapInterval(0)', s)
-                  if s2 != s:
-                      open(p, 'w', encoding='utf-8').write(s2)
-                      log("FPS: vsync disabled in " + p)
-          except Exception as e:
-              log("FPS vsync step skipped: %r" % (e,))
-
-          # =====================================================
-          # 2) Touch buttons: black + translucent
-          #    a) recolor the button textures to (almost) black
-          #       (alpha shape is kept)
-          #    b) force a low alpha on the colors the touch
-          #       controller code sets
-          # =====================================================
-          TOUCH_ALPHA = 110      # 0 = invisible ... 255 = solid
-          DARKEN = 0.12          # 0 = pure black, 1 = unchanged
-
-          try:
-              from PIL import Image
-              files = sorted(glob.glob('textures/touchcontrols/*.png'))
-              if not files:
-                  log("TOUCH WARNING: no textures/touchcontrols/*.png found")
-              for p in files:
-                  name = os.path.basename(p).lower()
-                  if not re.search(r'button|joy|stick|dpad|circle|pad', name):
-                      log("TOUCH: texture left untouched: " + p)
-                      continue
-                  im = Image.open(p).convert('RGBA')
-                  r, g, b, a = im.split()
-                  f = lambda v: int(v * DARKEN)
-                  Image.merge('RGBA', (r.point(f), g.point(f), b.point(f), a)).save(p)
-                  log("TOUCH: texture darkened: " + p)
-          except Exception as e:
-              log("TOUCH texture step skipped: %r" % (e,))
-
-          def split_args(s):
-              out, depth, cur = [], 0, ''
-              for ch in s:
-                  if ch == ',' and depth == 0:
-                      out.append(cur); cur = ''
-                  else:
-                      if ch in '([': depth += 1
-                      elif ch in ')]': depth -= 1
-                      cur += ch
-              out.append(cur)
-              return out
-
-          def patch_alpha(src):
-              rx = re.compile(r'\bgDPSet(Env|Prim)Color\s*\(')
-              out, i, n = [], 0, 0
-              while True:
-                  m = rx.search(src, i)
-                  if not m:
-                      out.append(src[i:])
-                      break
-                  j, depth = m.end(), 1
-                  while j < len(src) and depth:
-                      if src[j] == '(': depth += 1
-                      elif src[j] == ')': depth -= 1
-                      j += 1
-                  args = split_args(src[m.end():j - 1])
-                  need = 5 if m.group(1) == 'Env' else 7
-                  if len(args) == need and args[-1].strip() != '0':
-                      args[-1] = ' %d' % TOUCH_ALPHA
-                      out.append(src[i:m.end()] + ','.join(args) + ')')
-                      n += 1
-                  else:
-                      out.append(src[i:j])
-                  i = j
-              return ''.join(out), n
-
-          try:
-              touch_c = [p for p in sorted(glob.glob('src/pc/**/*.c', recursive=True))
-                         if 'touch' in os.path.basename(p).lower()]
-              if not touch_c:
-                  log("TOUCH WARNING: no *touch*.c file under src/pc")
-              for p in touch_c:
-                  s = open(p, encoding='utf-8', errors='replace').read()
-                  s2, n = patch_alpha(s)
-                  if n:
-                      open(p, 'w', encoding='utf-8').write(s2)
-                  log("TOUCH: %s -> %d color call(s) set to alpha %d" % (p, n, TOUCH_ALPHA))
-          except Exception as e:
-              log("TOUCH alpha step skipped: %r" % (e,))
-
-          open('../../../../patch-report.txt', 'w').write("\n".join(report) + "\n")
-          PY
 
       - name: Install native build dependencies
         run: |
@@ -335,6 +111,579 @@ jobs:
             echo "::warning::host make exited with $status but all generated files exist; continuing to the Android build."
           fi
 
+      - name: Apply level-select, touch-UI and frame-pacing patch
+        working-directory: android-base/app/jni/src
+        run: |
+          # Applied AFTER the native (host) make on purpose: the host build only
+          # generates assets and must see the unpatched sources.
+          cat > "$RUNNER_TEMP/touch_level_select.c" <<'CEOF'
+          // Touch level select screen and shared translucent touch-UI drawing helpers.
+          // Added for the Android build. Drawn with the game's own display lists, so
+          // it renders through the same Fast3D/OpenGL ES path as the rest of the HUD.
+          #ifdef TOUCH_CONTROLS
+          #include <PR/ultratypes.h>
+          #include <PR/gbi.h>
+
+          #include "config.h"
+          #include "sm64.h"
+          #include "types.h"
+          #include "audio/external.h"
+          #include "game/area.h"
+          #include "game/game_init.h"
+          #include "game/memory.h"
+          #include "game/segment2.h"
+          #include "level_table.h"
+
+          #include "controller_touchscreen.h"
+
+          // ---------------------------------------------------------------------------
+          // Drawing helpers. All coordinates are "API units": 1280 x 960 for the 4:3
+          // area, i.e. 4 units per virtual pixel (same space the touch controls use).
+          // ---------------------------------------------------------------------------
+
+          ALIGNED8 static u8 sSolidTexture[16 * 16 * 2];
+          static int sSolidTextureReady = 0;
+
+          static void set_texture(const u8 *img) {
+              gDPPipeSync(gDisplayListHead++);
+              gDPSetTextureImage(gDisplayListHead++, G_IM_FMT_RGBA, G_IM_SIZ_16b, 1, img);
+              gSPDisplayList(gDisplayListHead++, dl_hud_img_load_tex_block);
+          }
+
+          void touch_ui_begin(void) {
+              Mtx *mtx;
+
+              if (!sSolidTextureReady) {
+                  int i;
+                  for (i = 0; i < (int) sizeof(sSolidTexture); i++) {
+                      sSolidTexture[i] = 0xFF; // RGBA5551 white, opaque
+                  }
+                  sSolidTextureReady = 1;
+              }
+
+              mtx = alloc_display_list(sizeof(*mtx));
+              if (mtx == NULL) {
+                  return;
+              }
+
+              guOrtho(mtx, 0.0f, SCREEN_WIDTH, 0.0f, SCREEN_HEIGHT, -10.0f, 10.0f, 1.0f);
+              gSPPerspNormalize((Gfx *) (gDisplayListHead++), 0xFFFF);
+              gSPMatrix(gDisplayListHead++, VIRTUAL_TO_PHYSICAL(mtx), G_MTX_PROJECTION | G_MTX_LOAD | G_MTX_NOPUSH);
+
+              // 1-cycle, translucent: colour = texel * env colour, alpha = texel alpha * env alpha
+              gDPPipeSync(gDisplayListHead++);
+              gDPSetCycleType(gDisplayListHead++, G_CYC_1CYCLE);
+              gDPSetTexturePersp(gDisplayListHead++, G_TP_NONE);
+              gDPSetAlphaCompare(gDisplayListHead++, G_AC_NONE);
+              gDPSetTextureFilter(gDisplayListHead++, G_TF_POINT);
+              gDPSetCombineMode(gDisplayListHead++, G_CC_FADEA, G_CC_FADEA);
+              gDPSetRenderMode(gDisplayListHead++, G_RM_AA_XLU_SURF, G_RM_AA_XLU_SURF2);
+          }
+
+          void touch_ui_end(void) {
+              gSPDisplayList(gDisplayListHead++, dl_hud_img_end);
+          }
+
+          // Draw a 16x16 texture stretched over the rectangle.
+          void touch_ui_quad(const u8 *tex, s32 x0, s32 y0, s32 x1, s32 y1, u8 r, u8 g, u8 b, u8 a) {
+              s32 w = x1 - x0;
+              s32 h = y1 - y0;
+              s16 dsdx;
+              s16 dtdy;
+
+              if (w <= 0 || h <= 0) {
+                  return;
+              }
+              // S5.10 texels per pixel: 16 texels over (w / 4) pixels
+              dsdx = (s16) (65536 / w);
+              dtdy = (s16) (65536 / h);
+
+              set_texture(tex);
+              gDPSetEnvColor(gDisplayListHead++, r, g, b, a);
+              gSPTextureRectangle(gDisplayListHead++, x0, y0, x1, y1, G_TX_RENDERTILE, 0, 0, dsdx, dtdy);
+          }
+
+          void touch_ui_card(s32 x0, s32 y0, s32 x1, s32 y1, u8 r, u8 g, u8 b, u8 a) {
+              touch_ui_quad(sSolidTexture, x0, y0, x1, y1, r, g, b, a);
+          }
+
+          s32 touch_ui_text_width(s32 size, const char *s) {
+              s32 n = 0;
+              while (s[n] != '\0') {
+                  n++;
+              }
+              return n * (size * 3 / 4);
+          }
+
+          // Letters, digits and spaces only (HUD font glyph table).
+          void touch_ui_text(s32 x, s32 y, s32 size, const char *s, u8 r, u8 g, u8 b, u8 a) {
+              const u8 *const *glyphs = segmented_to_virtual(main_hud_lut);
+              s32 advance = size * 3 / 4;
+              s32 i;
+
+              for (i = 0; s[i] != '\0'; i++) {
+                  char c = s[i];
+                  int glyph = -1;
+
+                  if (c >= 'A' && c <= 'Z') {
+                      glyph = c - 55;
+                  } else if (c >= 'a' && c <= 'z') {
+                      glyph = c - 87;
+                  } else if (c >= '0' && c <= '9') {
+                      glyph = c - 48;
+                  }
+                  if (glyph >= 0) {
+                      touch_ui_quad(glyphs[glyph], x + i * advance, y, x + i * advance + size, y + size, r, g, b, a);
+                  }
+              }
+          }
+
+          // ---------------------------------------------------------------------------
+          // Level select screen
+          // ---------------------------------------------------------------------------
+
+          struct LevelCard {
+              const char *name;
+              s16 level;
+          };
+
+          // Only courses whose data is compiled into this build. The workflow checks
+          // that every level listed here has its generated assets before the APK is built.
+          static const struct LevelCard sLevels[] = {
+              { "BOBOMB BATTLEFIELD", LEVEL_BOB },
+              { "WHOMPS FORTRESS", LEVEL_WF },
+              { "JOLLY ROGER BAY", LEVEL_JRB },
+              { "COOL COOL MOUNTAIN", LEVEL_CCM },
+              { "BIG BOOS HAUNT", LEVEL_BBH },
+              { "HAZY MAZE CAVE", LEVEL_HMC },
+              { "LETHAL LAVA LAND", LEVEL_LLL },
+              { "SHIFTING SAND LAND", LEVEL_SSL },
+              { "DIRE DIRE DOCKS", LEVEL_DDD },
+              { "SNOWMANS LAND", LEVEL_SL },
+              { "WET DRY WORLD", LEVEL_WDW },
+              { "TALL TALL MOUNTAIN", LEVEL_TTM },
+              { "TINY HUGE ISLAND", LEVEL_THI },
+              { "TICK TOCK CLOCK", LEVEL_TTC },
+              { "RAINBOW RIDE", LEVEL_RR },
+          };
+          #define LEVEL_COUNT ((int) (sizeof(sLevels) / sizeof(sLevels[0])))
+
+          #define ROWS_PER_PAGE 5
+          #define LIST_X0 120
+          #define LIST_X1 820
+          #define ROW_Y0 200
+          #define ROW_H 110
+          #define ROW_STEP 126
+          #define PAGE_Y0 850
+          #define PAGE_Y1 930
+          #define COL_X0 860
+          #define COL_X1 1160
+          #define CHIP_SIZE 90
+          #define CHIP_STEP 105
+          #define CHIP_Y0 290
+          #define PLAY_Y0 600
+          #define PLAY_Y1 760
+
+          static int sSelected = 0;
+          static int sPage = 0;
+          static int sMission = 1;
+
+          static int hit(int x, int y, int x0, int y0, int x1, int y1) {
+              return x >= x0 && x < x1 && y >= y0 && y < y1;
+          }
+
+          static int start_selected_level(void) {
+              gLevelSelectUiActive = 0;
+              gCurrSaveFileNum = 1;
+              gCurrLevelNum = sLevels[sSelected].level;
+              gCurrActNum = sMission;
+              play_sound(SOUND_MENU_STAR_SOUND, gDefaultSoundArgs);
+              return gCurrLevelNum;
+          }
+
+          // Called once per frame by the level script (replaces the original debug
+          // level select input loop). Returns the level number once Play is tapped.
+          s16 touch_level_select_update(void) {
+              int tx;
+              int ty;
+              int i;
+
+              gLevelSelectUiActive = 1;
+              gLevelSelectBackRequested = 0;
+              gCurrSaveFileNum = 1;
+              gCurrActNum = sMission;
+
+              // Physical gamepad / keyboard Start also starts the highlighted level.
+              if (gPlayer1Controller->buttonPressed & START_BUTTON) {
+                  return start_selected_level();
+              }
+
+              if (!touch_ui_poll_tap(&tx, &ty)) {
+                  return 0;
+              }
+
+              for (i = 0; i < ROWS_PER_PAGE; i++) {
+                  int idx = sPage * ROWS_PER_PAGE + i;
+                  int y0 = ROW_Y0 + i * ROW_STEP;
+                  if (idx < LEVEL_COUNT && hit(tx, ty, LIST_X0, y0, LIST_X1, y0 + ROW_H)) {
+                      sSelected = idx;
+                      play_sound(SOUND_GENERAL_LEVEL_SELECT_CHANGE, gDefaultSoundArgs);
+                      return 0;
+                  }
+              }
+
+              if (hit(tx, ty, LIST_X0, PAGE_Y0, 460, PAGE_Y1) && sPage > 0) {
+                  sPage--;
+                  play_sound(SOUND_GENERAL_LEVEL_SELECT_CHANGE, gDefaultSoundArgs);
+                  return 0;
+              }
+              if (hit(tx, ty, 480, PAGE_Y0, LIST_X1, PAGE_Y1) && (sPage + 1) * ROWS_PER_PAGE < LEVEL_COUNT) {
+                  sPage++;
+                  play_sound(SOUND_GENERAL_LEVEL_SELECT_CHANGE, gDefaultSoundArgs);
+                  return 0;
+              }
+
+              for (i = 0; i < 6; i++) {
+                  int cx = COL_X0 + (i % 3) * CHIP_STEP;
+                  int cy = CHIP_Y0 + (i / 3) * CHIP_STEP;
+                  if (hit(tx, ty, cx, cy, cx + CHIP_SIZE, cy + CHIP_SIZE)) {
+                      sMission = i + 1;
+                      play_sound(SOUND_GENERAL_LEVEL_SELECT_CHANGE, gDefaultSoundArgs);
+                      return 0;
+                  }
+              }
+
+              if (hit(tx, ty, COL_X0, PLAY_Y0, COL_X1, PLAY_Y1)) {
+                  return start_selected_level();
+              }
+
+              return 0;
+          }
+
+          static void draw_button(int x0, int y0, int x1, int y1, const char *label, int size, int enabled) {
+              s32 tw = touch_ui_text_width(size, label);
+              u8 a = enabled ? 255 : 90;
+
+              touch_ui_card(x0, y0, x1, y1, 0, 0, 0, 128);
+              touch_ui_text((x0 + x1 - tw) / 2, (y0 + y1 - size) / 2, size, label, 255, 255, 255, a);
+          }
+
+          void render_level_select_ui(void) {
+              char digit[2];
+              int i;
+              s32 tw;
+
+              touch_ui_begin();
+
+              tw = touch_ui_text_width(64, "SELECT LEVEL");
+              touch_ui_text(640 - tw / 2, 90, 64, "SELECT LEVEL", 255, 255, 255, 255);
+
+              for (i = 0; i < ROWS_PER_PAGE; i++) {
+                  int idx = sPage * ROWS_PER_PAGE + i;
+                  int y0 = ROW_Y0 + i * ROW_STEP;
+                  if (idx >= LEVEL_COUNT) {
+                      break;
+                  }
+                  if (idx == sSelected) {
+                      touch_ui_card(LIST_X0 - 10, y0 - 10, LIST_X1 + 10, y0 + ROW_H + 10, 255, 255, 255, 220);
+                  }
+                  touch_ui_card(LIST_X0, y0, LIST_X1, y0 + ROW_H, 0, 0, 0, idx == sSelected ? 190 : 128);
+                  touch_ui_text(LIST_X0 + 40, y0 + (ROW_H - 48) / 2, 48, sLevels[idx].name, 255, 255, 255, 255);
+              }
+
+              draw_button(LIST_X0, PAGE_Y0, 460, PAGE_Y1, "PREV", 40, sPage > 0);
+              draw_button(480, PAGE_Y0, LIST_X1, PAGE_Y1, "NEXT", 40, (sPage + 1) * ROWS_PER_PAGE < LEVEL_COUNT);
+
+              tw = touch_ui_text_width(40, "MISSION");
+              touch_ui_text((COL_X0 + COL_X1 - tw) / 2, 215, 40, "MISSION", 255, 255, 255, 255);
+              digit[1] = '\0';
+              for (i = 0; i < 6; i++) {
+                  int cx = COL_X0 + (i % 3) * CHIP_STEP;
+                  int cy = CHIP_Y0 + (i / 3) * CHIP_STEP;
+                  if (i + 1 == sMission) {
+                      touch_ui_card(cx - 8, cy - 8, cx + CHIP_SIZE + 8, cy + CHIP_SIZE + 8, 255, 255, 255, 220);
+                  }
+                  touch_ui_card(cx, cy, cx + CHIP_SIZE, cy + CHIP_SIZE, 0, 0, 0, i + 1 == sMission ? 190 : 128);
+                  digit[0] = (char) ('1' + i);
+                  touch_ui_text(cx + (CHIP_SIZE - 36) / 2, cy + (CHIP_SIZE - 48) / 2, 48, digit, 255, 255, 255, 255);
+              }
+
+              touch_ui_card(COL_X0 - 8, PLAY_Y0 - 8, COL_X1 + 8, PLAY_Y1 + 8, 255, 255, 255, 220);
+              draw_button(COL_X0, PLAY_Y0, COL_X1, PLAY_Y1, "PLAY", 64, 1);
+
+              touch_ui_end();
+          }
+
+          #endif // TOUCH_CONTROLS
+          CEOF
+          cat > "$RUNNER_TEMP/apply_patches.py" <<'PYEOF'
+          # Android level-select + touch + frame-pacing patch for sm64-port-android.
+          # Run from the game source root (app/jni/src). Every edit asserts its anchor.
+          import sys
+
+          def patch(path, old, new, count=1):
+              s = open(path).read()
+              assert s.count(old) == count, "anchor found %d times (want %d) in %s:\n%s" % (s.count(old), count, path, old)
+              open(path, "w").write(s.replace(old, new))
+
+          # --- 1. new source file: level select screen + shared translucent UI helpers
+          open("src/pc/controller/touch_level_select.c", "w").write(open(sys.argv[1]).read())
+
+          # --- 2. touch controller header: shared declarations
+          patch("src/pc/controller/controller_touchscreen.h",
+          "extern struct ControllerAPI controller_touchscreen;\n",
+          """extern struct ControllerAPI controller_touchscreen;
+
+          #include <PR/ultratypes.h>
+          extern s32 gLevelSelectUiActive;      // 1 while the level select screen is shown
+          extern s32 gLevelSelectBackRequested; // set by the in-game Back button
+          int touch_ui_poll_tap(int *x, int *y);
+          void touch_ui_begin(void);
+          void touch_ui_end(void);
+          void touch_ui_quad(const u8 *tex, s32 x0, s32 y0, s32 x1, s32 y1, u8 r, u8 g, u8 b, u8 a);
+          void touch_ui_card(s32 x0, s32 y0, s32 x1, s32 y1, u8 r, u8 g, u8 b, u8 a);
+          void touch_ui_text(s32 x, s32 y, s32 size, const char *s, u8 r, u8 g, u8 b, u8 a);
+          s32 touch_ui_text_width(s32 size, const char *s);
+          s16 touch_level_select_update(void);
+          void render_level_select_ui(void);
+          """)
+
+          # --- 3. touch controller: tap polling, Back button hit test
+          patch("src/pc/controller/controller_touchscreen.c",
+          "#define JOYSTICK_SIZE 280\n",
+          """#define JOYSTICK_SIZE 280
+
+          s32 gLevelSelectUiActive = 0;
+          static int sTapPending = 0;
+          static int sTapX = 0;
+          static int sTapY = 0;
+
+          // "BACK" button (API units), bottom left of the Start button.
+          #define BACK_X0 380
+          #define BACK_Y0 850
+          #define BACK_X1 580
+          #define BACK_Y1 950
+
+          int touch_ui_poll_tap(int *x, int *y) {
+              if (!sTapPending) {
+                  return 0;
+              }
+              *x = sTapX;
+              *y = sTapY;
+              sTapPending = 0;
+              return 1;
+          }
+          """)
+
+          patch("src/pc/controller/controller_touchscreen.c",
+          "void touch_down(struct TouchEvent* event) {\n    struct Position pos;\n",
+          """void touch_down(struct TouchEvent* event) {
+              struct Position pos;
+
+              sTapX = (int) CORRECT_TOUCH_X(event->x);
+              sTapY = (int) CORRECT_TOUCH_Y(event->y);
+              sTapPending = 1;
+              if (gLevelSelectUiActive) {
+                  return; // level select screen handles taps itself
+              }
+              if (sTapX >= BACK_X0 && sTapX < BACK_X1 && sTapY >= BACK_Y0 && sTapY < BACK_Y1) {
+                  gLevelSelectBackRequested = 1;
+                  return;
+              }
+          """)
+
+          # --- 4. touch controller rendering: black, ~50% opacity (128/255)
+          s = open("src/pc/controller/controller_touchscreen.c").read()
+          a = s.index("void render_touch_controls(void) {")
+          b = s.index("static void touchscreen_init() {")
+          new_render = r'''#define TOUCH_ALPHA 128         // 50% black
+          #define TOUCH_ALPHA_PRESSED 192 // 75% black while held
+          #define TOUCH_LABEL_ALPHA 140   // white labels at ~55%
+
+          static void touch_sprite(const u8 *tex, s32 x, s32 y, int scaling, u8 r, u8 g, u8 b, u8 a) {
+              touch_ui_quad(tex, x - (15 << scaling), y - (15 << scaling), x + (15 << scaling), y + (15 << scaling), r, g, b, a);
+          }
+
+          void render_touch_controls(void) {
+              const u8 *const *glyphs;
+              struct Position pos;
+
+              if (gLevelSelectUiActive) {
+                  render_level_select_ui();
+                  sTapPending = 0;
+                  return;
+              }
+
+              glyphs = segmented_to_virtual(main_hud_lut);
+              touch_ui_begin();
+
+              for (int i = 0; i < ControlElementsLength; i++) {
+                  switch (ControlElements[i].type) {
+                      case Joystick:
+                          pos = ControlElements[i].GetPos();
+                          touch_sprite(texture_button, pos.x, pos.y, 3, 0, 0, 0, TOUCH_ALPHA);
+                          touch_sprite(texture_button, pos.x + 4 + ControlElements[i].joyX, pos.y + 4 + ControlElements[i].joyY, 2, 0, 0, 0, TOUCH_ALPHA);
+                          break;
+                      case Button:
+                          pos = ControlElements[i].GetPos();
+                          touch_sprite(texture_button, pos.x - 8, pos.y, 2, 0, 0, 0,
+                                       ControlElements[i].touchID ? TOUCH_ALPHA_PRESSED : TOUCH_ALPHA);
+                          touch_sprite(glyphs[ControlElements[i].character - 87], pos.x, pos.y, 1, 255, 255, 255, TOUCH_LABEL_ALPHA);
+                          break;
+                  }
+              }
+
+              // In-game Back button: returns to the level select screen.
+              touch_ui_card(BACK_X0, BACK_Y0, BACK_X1, BACK_Y1, 0, 0, 0, TOUCH_ALPHA);
+              touch_ui_text((BACK_X0 + BACK_X1 - touch_ui_text_width(48, "BACK")) / 2, (BACK_Y0 + BACK_Y1 - 48) / 2, 48,
+                            "BACK", 255, 255, 255, TOUCH_LABEL_ALPHA);
+
+              touch_ui_end();
+              sTapPending = 0;
+          }
+
+          '''
+          s = s[:a] + new_render + s[b:]
+          open("src/pc/controller/controller_touchscreen.c", "w").write(s)
+
+          # --- 5. replace the debug level select input loop with the touch screen
+          patch("src/menu/level_select_menu.c",
+          "s16 level_select_input_loop(void) {\n",
+          """#ifdef TOUCH_CONTROLS
+          extern s16 touch_level_select_update(void);
+          s16 level_select_input_loop(void) {
+              return touch_level_select_update();
+          }
+          static UNUSED s16 level_select_input_loop_original(void) {
+          #else
+          s16 level_select_input_loop(void) {
+          #endif
+          """)
+
+          # --- 6. boot into the level select screen (original debug select screen script)
+          patch("levels/entry.c",
+          "/*entry*/ level_intro_entry_1),",
+          "/*entry*/ level_intro_entry_4),")
+
+          # --- 7. enable the engine's debug-level-select mode: no act select, finishing a
+          # course / dying / pause->Exit Course return to the level select screen.
+          patch("src/pc/pc_main.c",
+          "    audio_init();\n    sound_init();\n",
+          "    gDebugLevelSelect = TRUE; // original engine level-select mode\n    audio_init();\n    sound_init();\n")
+
+          # --- 8. Back button request handled inside the level update, using the same
+          # fade + special warp (-9) the original pause-menu 'Exit Course' uses.
+          patch("src/game/level_update.c",
+          "s32 update_level(void) {\n    s32 changeLevel;\n\n    switch (sCurrPlayMode) {",
+          """s32 gLevelSelectBackRequested = 0;
+
+          s32 update_level(void) {
+              s32 changeLevel;
+
+              if (gLevelSelectBackRequested) {
+                  gLevelSelectBackRequested = FALSE;
+                  if (sCurrPlayMode == PLAY_MODE_NORMAL || sCurrPlayMode == PLAY_MODE_PAUSED) {
+                      gCameraMovementFlags &= ~CAM_MOVE_PAUSE_SCREEN;
+                      fade_into_special_warp(-9, 1);
+                  }
+              }
+
+              switch (sCurrPlayMode) {""")
+          patch("src/game/level_update.c",
+          "s32 init_level(void) {\n    s32 val4 = 0;\n\n    set_play_mode(PLAY_MODE_NORMAL);",
+          "s32 init_level(void) {\n    s32 val4 = 0;\n\n    gLevelSelectBackRequested = FALSE;\n    set_play_mode(PLAY_MODE_NORMAL);")
+
+          # --- 9. frame pacing (Android): exact 30 Hz fixed timestep on a monotonic
+          # high-resolution clock, and refresh-rate-aware repeat count.
+          G = "src/pc/gfx/gfx_sdl2.c"
+          patch(G, "    Uint32 start;\n    Uint32 end;\n", "    Uint64 start;\n    Uint64 end;\n")
+          patch(G,
+          """    start = SDL_GetTicks();
+              SDL_GL_SwapWindow(wnd);
+              SDL_GL_SwapWindow(wnd);
+              SDL_GL_SwapWindow(wnd);
+              SDL_GL_SwapWindow(wnd);
+              end = SDL_GetTicks();
+
+              float average = 4.0 * 1000.0 / (end - start);
+          """,
+          """    start = SDL_GetPerformanceCounter();
+              for (int swap_i = 0; swap_i < 16; swap_i++) {
+                  SDL_GL_SwapWindow(wnd);
+              }
+              end = SDL_GetPerformanceCounter();
+
+              float average = 16.0 * (double) SDL_GetPerformanceFrequency() / (double) (end - start);
+          """)
+          patch(G,
+          """    render_multiplier = (average + 15) / 30;
+              if (render_multiplier == 0)
+                  render_multiplier = 1;
+          """,
+          """    // Largest whole number of display refreshes that fits in one 30 Hz game
+              // tick; the pacing limiter below supplies the remaining time exactly.
+              render_multiplier = (int) (average / 30.0f + 0.05f);
+              if (render_multiplier < 1 || average > 150.0f)
+                  render_multiplier = 1;
+          """)
+          patch(G,
+          "static void gfx_sdl_swap_buffers_end(void) {\n}\n",
+          """#ifdef __ANDROID__
+          // Fixed 30 Hz game tick on a monotonic high-resolution clock, called once per
+          // game tick. Frames that finish early wait out the rest of the period; frames
+          // that finish late are made up for by shorter waits afterwards, so the long-run
+          // rate is exactly 30 ticks/s on any refresh rate (60, 72, 90, 120 Hz...).
+          static void android_pace_frame(void) {
+              static Uint64 deadline = 0;
+              const Uint64 freq = SDL_GetPerformanceFrequency();
+              const Uint64 period = freq / 30;
+              Uint64 now = SDL_GetPerformanceCounter();
+
+              if (deadline == 0 || now > deadline + period * 2) {
+                  deadline = now; // first frame, or a long stall (app paused, level load)
+              } else if (now < deadline) {
+                  Uint64 ms = (deadline - now) * 1000 / freq;
+                  if (ms > 1) {
+                      SDL_Delay((Uint32) (ms - 1));
+                  }
+                  while (SDL_GetPerformanceCounter() < deadline) {
+                  }
+              }
+              deadline += period;
+          }
+          #endif
+
+          static void gfx_sdl_swap_buffers_end(void) {
+          #ifdef __ANDROID__
+              android_pace_frame();
+          #endif
+          }
+          """)
+          print("android level select / touch / pacing patch applied")
+          PYEOF
+          python3 "$RUNNER_TEMP/apply_patches.py" "$RUNNER_TEMP/touch_level_select.c"
+          git status --short | head -20 || true
+
+      - name: Verify every level on the select screen has generated assets
+        working-directory: android-base/app/jni/src
+        run: |
+          levels=$(grep -o ', LEVEL_[A-Z]* }' src/pc/controller/touch_level_select.c | sed 's/, LEVEL_//; s/ }//' | tr 'A-Z' 'a-z')
+          test -n "$levels" || { echo "::error::could not read level list"; exit 1; }
+          missing=0
+          for f in $levels; do
+            for need in levels/$f/script.c levels/$f/geo.c levels/$f/leveldata.c \
+                        build/us_pc/levels/$f/leveldata.o build/us_pc/levels/$f/script.o; do
+              if [ ! -f "$need" ]; then echo "::error::level '$f' missing $need"; missing=1; fi
+            done
+            if [ -f "levels/$f/texture.inc.c" ]; then
+              for inc in $(grep -o '#include "[^"]*\.inc\.c"' "levels/$f/texture.inc.c" | sed 's/#include "//; s/"$//'); do
+                if [ ! -f "build/us_pc/$inc" ]; then echo "::error::level '$f' missing generated texture build/us_pc/$inc"; missing=1; fi
+              done
+            fi
+          done
+          if [ "$missing" -ne 0 ]; then exit 1; fi
+          echo "verified assets for levels: $(echo $levels)"
+
       - name: Set up JDK 11 (for Gradle 7.1 / AGP 4.2.1)
         uses: actions/setup-java@v4
         with:
@@ -361,345 +710,11 @@ jobs:
           grep -q "^ *abiFilters '$ABI'\$" app/build.gradle || { echo "::error::abiFilters was not rewritten to $ABI"; exit 1; }
           grep -q "^APP_ABI := $ABI\$" app/jni/Application.mk || { echo "::error::APP_ABI was not rewritten to $ABI"; exit 1; }
 
-      - name: Optimize native build for low-end Android (release native flags)
-        working-directory: android-base
-        run: |
-          python3 - <<'PY'
-          import re
-          report = open('../patch-report.txt', 'a')
-          def log(m):
-              print(m, flush=True)
-              report.write(m + "\n")
-
-          # 1) Application.mk: force optimized native code (debug builds are -O0 = very slow)
-          p = 'app/jni/Application.mk'
-          s = open(p).read()
-          s = re.sub(r'(?m)^\s*APP_OPTIM\s*[:+?]?=.*\n?', '', s)
-          s = s.rstrip('\n') + '\nAPP_OPTIM := release\n'
-          open(p, 'w').write(s)
-          log("OPT: APP_OPTIM := release in " + p)
-
-          # 2) Gradle: do not ask ndk-build for a debuggable (NDK_DEBUG=1) build
-          p = 'app/build.gradle'
-          g = open(p).read()
-          if 'jniDebuggable' in g:
-              log("OPT: build.gradle already has jniDebuggable - left alone")
-          else:
-              ins = "\n        debug {\n            jniDebuggable false\n        }\n"
-              m = re.search(r'buildTypes\s*\{', g)
-              if m:
-                  g = g[:m.end()] + ins + g[m.end():]
-              else:
-                  m = re.search(r'\bandroid\s*\{', g)
-                  if m:
-                      g = g[:m.end()] + "\n    buildTypes {" + ins + "    }\n" + g[m.end():]
-              if 'jniDebuggable' in g:
-                  open(p, 'w').write(g)
-                  log("OPT: jniDebuggable false added to " + p)
-              else:
-                  log("OPT WARNING: could not edit build.gradle")
-
-          # 3) game Android.mk: -O3 and ARM (not Thumb) code
-          p = 'app/jni/src/Android.mk'
-          s = open(p).read()
-          s = re.sub(r'-O0\b', '-O3', s)
-          line = "LOCAL_ARM_MODE := arm\nLOCAL_CFLAGS += -O3\n"
-          rx = re.compile(r'(?m)^\s*include\s+\$\(BUILD_SHARED_LIBRARY\)')
-          if 'LOCAL_ARM_MODE := arm' not in s and rx.search(s):
-              m = rx.search(s)
-              s = s[:m.start()] + line + s[m.start():]
-              log("OPT: -O3 + ARM mode added to " + p)
-          else:
-              log("OPT WARNING: BUILD_SHARED_LIBRARY line not found in " + p)
-          open(p, 'w').write(s)
-          PY
-          echo "---- flags currently in the makefiles ----"
-          grep -n -E "APP_OPTIM|APP_CFLAGS|LOCAL_CFLAGS|LOCAL_ARM|-O[0-3s]|jniDebuggable" app/jni/Application.mk app/jni/src/Android.mk app/build.gradle || true
-
-      - name: Add in-game stats overlay + menu (FPS, resolution, render scale)
-        run: |
-          python3 - <<'PY'
-          import glob, os, re, shutil
-
-          report = open('patch-report.txt', 'a')
-          def log(m):
-              print(m, flush=True)
-              report.write(m + "\n")
-
-          BASE = 'android-base'
-          acts = sorted(glob.glob(BASE + '/app/src/**/SDLActivity.java', recursive=True))
-          if not acts:
-              log("OVERLAY: SDLActivity.java not found - menu skipped")
-              raise SystemExit(0)
-          act_path = acts[0]
-          pkgdir = os.path.dirname(act_path)
-          act_src = open(act_path, encoding='utf-8').read()
-          pkg = re.search(r'(?m)^\s*package\s+([\w.]+)\s*;', act_src).group(1)
-
-          if not re.search(r'setContentView\(\s*mLayout\s*\)\s*;', act_src):
-              log("OVERLAY: 'setContentView(mLayout);' not found - menu skipped")
-              raise SystemExit(0)
-
-          os.makedirs('overlay-backup', exist_ok=True)
-          def backup(path):
-              rel = os.path.relpath(path, BASE)
-              dst = os.path.join('overlay-backup', rel)
-              os.makedirs(os.path.dirname(dst), exist_ok=True)
-              if not os.path.exists(dst):
-                  shutil.copy(path, dst)
-
-          # --- touch fix: with a smaller render buffer SDL must still normalise
-          #     finger positions by the REAL view size, otherwise touch breaks ---
-          nx = ny = 0
-          for jp in sorted(glob.glob(pkgdir + '/*.java')):
-              s = open(jp, encoding='utf-8').read()
-              s2, a = re.subn(r'(\.getX\(\s*\w*\s*\))\s*/\s*mWidth\b', r'\1 / (float) getWidth()', s)
-              s2, b = re.subn(r'(\.getY\(\s*\w*\s*\))\s*/\s*mHeight\b', r'\1 / (float) getHeight()', s2)
-              if a or b:
-                  backup(jp)
-                  open(jp, 'w', encoding='utf-8').write(s2)
-                  log("OVERLAY: touch normalisation patched in %s (x:%d y:%d)" % (jp, a, b))
-              nx += a; ny += b
-          scale_ok = (nx > 0 and ny > 0)
-          if not scale_ok:
-              log("OVERLAY: touch normalisation not found - render-scale option disabled")
-
-          # --- hook into SDLActivity.onCreate ---
-          backup(act_path)
-          act_src = open(act_path, encoding='utf-8').read()
-          act_src = re.sub(r'(setContentView\(\s*mLayout\s*\)\s*;)',
-                           r'\1\n        SM64Overlay.attach(this, mSurface, mLayout);',
-                           act_src, count=1)
-          open(act_path, 'w', encoding='utf-8').write(act_src)
-
-          JAVA = r"""package @@PKG@@;
-
-          import android.app.Activity;
-          import android.app.AlertDialog;
-          import android.content.DialogInterface;
-          import android.content.SharedPreferences;
-          import android.graphics.Color;
-          import android.os.Build;
-          import android.os.Handler;
-          import android.os.Looper;
-          import android.util.Log;
-          import android.view.Gravity;
-          import android.view.SurfaceView;
-          import android.view.View;
-          import android.view.ViewGroup;
-          import android.widget.FrameLayout;
-          import android.widget.TextView;
-
-          import java.io.BufferedReader;
-          import java.io.File;
-          import java.io.FileReader;
-
-          /** Small on-screen FPS / resolution bar + menu. Injected at build time. */
-          public class SM64Overlay {
-              static final boolean SCALE_OK = @@SCALE@@;
-              private static final int[] SCALES = {100, 75, 60, 50, 40};
-              private static final String TAG = "SM64Overlay";
-
-              private static TextView bar;
-              private static boolean showStats = true;
-              private static int scaleIdx = 3;
-              private static String fps = "--";
-              private static String ms = "--";
-              private static int renderW = 0;
-              private static int renderH = 0;
-              private static int viewW = 0;
-              private static int viewH = 0;
-
-              public static void attach(final Activity act, final View surface, final ViewGroup layout) {
-                  try {
-                      doAttach(act, surface, layout);
-                  } catch (Throwable t) {
-                      Log.e(TAG, "overlay disabled", t);
-                  }
-              }
-
-              private static void doAttach(final Activity act, final View surface, final ViewGroup layout) {
-                  final SharedPreferences prefs = act.getSharedPreferences("sm64_overlay", 0);
-                  showStats = prefs.getBoolean("stats", true);
-                  scaleIdx = prefs.getInt("scale", 3);
-                  if (scaleIdx < 0 || scaleIdx >= SCALES.length) {
-                      scaleIdx = 3;
-                  }
-
-                  FrameLayout root = new FrameLayout(act);
-                  bar = new TextView(act);
-                  bar.setTextColor(Color.WHITE);
-                  bar.setTextSize(11);
-                  bar.setPadding(14, 6, 14, 6);
-                  bar.setBackgroundColor(Color.argb(110, 0, 0, 0));
-                  bar.setOnClickListener(new View.OnClickListener() {
-                      public void onClick(View v) {
-                          showMenu(act, surface, prefs);
-                      }
-                  });
-                  FrameLayout.LayoutParams lp = new FrameLayout.LayoutParams(
-                          ViewGroup.LayoutParams.WRAP_CONTENT,
-                          ViewGroup.LayoutParams.WRAP_CONTENT,
-                          Gravity.BOTTOM | Gravity.CENTER_HORIZONTAL);
-                  root.addView(bar, lp);
-                  updateBar();
-                  layout.addView(root, new ViewGroup.LayoutParams(
-                          ViewGroup.LayoutParams.MATCH_PARENT,
-                          ViewGroup.LayoutParams.MATCH_PARENT));
-
-                  if (SCALE_OK) {
-                      surface.addOnLayoutChangeListener(new View.OnLayoutChangeListener() {
-                          public void onLayoutChange(View v, int left, int top, int right, int bottom,
-                                                     int oldLeft, int oldTop, int oldRight, int oldBottom) {
-                              int w = right - left;
-                              int h = bottom - top;
-                              if (w != viewW || h != viewH) {
-                                  viewW = w;
-                                  viewH = h;
-                                  applyScale(v);
-                              }
-                          }
-                      });
-                  }
-
-                  final Handler handler = new Handler(Looper.getMainLooper());
-                  final File statsFile = new File(act.getFilesDir(), "sm64_stats.txt");
-                  handler.post(new Runnable() {
-                      public void run() {
-                          readStats(statsFile);
-                          updateBar();
-                          handler.postDelayed(this, 500);
-                      }
-                  });
-              }
-
-              private static void applyScale(View surface) {
-                  if (!SCALE_OK || !(surface instanceof SurfaceView)) {
-                      return;
-                  }
-                  int w = surface.getWidth();
-                  int h = surface.getHeight();
-                  if (w <= 0 || h <= 0) {
-                      return;
-                  }
-                  int pct = SCALES[scaleIdx];
-                  SurfaceView sv = (SurfaceView) surface;
-                  if (pct >= 100) {
-                      sv.getHolder().setSizeFromLayout();
-                  } else {
-                      sv.getHolder().setFixedSize(Math.max(320, w * pct / 100), Math.max(180, h * pct / 100));
-                  }
-              }
-
-              private static void readStats(File f) {
-                  BufferedReader br = null;
-                  try {
-                      br = new BufferedReader(new FileReader(f));
-                      String line = br.readLine();
-                      if (line == null) {
-                          return;
-                      }
-                      String[] parts = line.trim().split(" ");
-                      for (int i = 0; i < parts.length; i++) {
-                          String[] kv = parts[i].split("=");
-                          if (kv.length != 2) {
-                              continue;
-                          }
-                          if (kv[0].equals("fps")) {
-                              fps = kv[1];
-                          } else if (kv[0].equals("ms")) {
-                              ms = kv[1];
-                          } else if (kv[0].equals("w")) {
-                              renderW = Integer.parseInt(kv[1]);
-                          } else if (kv[0].equals("h")) {
-                              renderH = Integer.parseInt(kv[1]);
-                          }
-                      }
-                  } catch (Throwable t) {
-                      // not written yet or being rewritten: keep the old values
-                  } finally {
-                      try {
-                          if (br != null) {
-                              br.close();
-                          }
-                      } catch (Throwable t2) {
-                          // ignore
-                      }
-                  }
-              }
-
-              private static void updateBar() {
-                  if (bar == null) {
-                      return;
-                  }
-                  if (showStats) {
-                      bar.setText("FPS " + fps + "  |  " + renderW + "x" + renderH + "  |  MENU");
-                  } else {
-                      bar.setText("MENU");
-                  }
-              }
-
-              private static void showMenu(final Activity act, final View surface, final SharedPreferences prefs) {
-                  StringBuilder sb = new StringBuilder();
-                  sb.append("FPS: ").append(fps).append("  (").append(ms).append(" ms/frame)\n");
-                  sb.append("Target frame rate: 30 FPS; actual FPS depends on device\n");
-                  sb.append("Render resolution: ").append(renderW).append("x").append(renderH).append("\n");
-                  sb.append("Screen: ").append(surface.getWidth()).append("x").append(surface.getHeight()).append("\n");
-                  sb.append("Display refresh: ").append(act.getWindowManager().getDefaultDisplay().getRefreshRate()).append(" Hz\n");
-                  if (SCALE_OK) {
-                      sb.append("Render scale: ").append(SCALES[scaleIdx]).append("%\n");
-                  }
-                  sb.append("Device: ").append(Build.MANUFACTURER).append(" ").append(Build.MODEL).append("\n");
-                  sb.append("Android ").append(Build.VERSION.RELEASE).append(" (API ").append(Build.VERSION.SDK_INT).append(")\n");
-                  sb.append("CPU ABI: ").append(Build.CPU_ABI);
-
-                  AlertDialog.Builder b = new AlertDialog.Builder(act);
-                  b.setTitle("SM64 Info");
-                  b.setMessage(sb.toString());
-                  b.setPositiveButton(showStats ? "Hide stats" : "Show stats", new DialogInterface.OnClickListener() {
-                      public void onClick(DialogInterface d, int which) {
-                          showStats = !showStats;
-                          prefs.edit().putBoolean("stats", showStats).apply();
-                          updateBar();
-                      }
-                  });
-                  if (SCALE_OK) {
-                      b.setNegativeButton("Scale " + SCALES[scaleIdx] + "% (change)", new DialogInterface.OnClickListener() {
-                          public void onClick(DialogInterface d, int which) {
-                              scaleIdx = (scaleIdx + 1) % SCALES.length;
-                              prefs.edit().putInt("scale", scaleIdx).apply();
-                              applyScale(surface);
-                          }
-                      });
-                  }
-                  b.setNeutralButton("Close", null);
-                  b.show();
-              }
-          }
-          """
-          # remove the YAML-induced indentation is already done by YAML; fill the tokens
-          JAVA = JAVA.replace('@@PKG@@', pkg).replace('@@SCALE@@', 'true' if scale_ok else 'false')
-          out = os.path.join(pkgdir, 'SM64Overlay.java')
-          open(out, 'w', encoding='utf-8').write(JAVA)
-          open('overlay-created.txt', 'w').write(out + "\n")
-          log("OVERLAY: SM64Overlay.java created in " + pkgdir + " (scale option: %s)" % scale_ok)
-          PY
-
       - name: Build debug APK
         working-directory: android-base
         run: |
           chmod +x gradlew
-          if ! ./gradlew assembleDebug --no-daemon --stacktrace; then
-            echo "::warning::Build failed. Retrying WITHOUT the Java overlay/menu patch."
-            if [ -d ../overlay-backup ]; then
-              cp -r ../overlay-backup/. .
-              if [ -f ../overlay-created.txt ]; then rm -f $(sed 's#^android-base/##' ../overlay-created.txt); fi
-              echo "OVERLAY: DISABLED (Java compile failed, retried without it)" >> ../patch-report.txt
-              ./gradlew assembleDebug --no-daemon --stacktrace
-            else
-              exit 1
-            fi
-          fi
+          ./gradlew assembleDebug --no-daemon --stacktrace
 
       - name: Verify APK exists and every native library is 32-bit ARM
         run: |
@@ -744,30 +759,6 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: build-logs
-          path: |
-            native-make.log
-            patch-report.txt
-          if-no-files-found: ignore
-          retention-days: 7
-
-      - name: Collect source files for diagnosis
-        if: always()
-        run: |
-          mkdir -p diag
-          S=android-base/app/jni/src
-          find "$S/src/pc" -maxdepth 2 -type f \( -iname '*touch*' -o -name 'gfx_sdl*.c' -o -name 'pc_main.c' \) -exec cp {} diag/ \; 2>/dev/null || true
-          find android-base/app/src -name 'SDLActivity.java' -o -name 'SM64Overlay.java' | while read f; do cp "$f" diag/; done
-          cp android-base/app/build.gradle diag/build.gradle.txt 2>/dev/null || true
-          cp android-base/app/jni/Application.mk diag/Application.mk.txt 2>/dev/null || true
-          cp "$S/Android.mk" diag/src-Android.mk.txt 2>/dev/null || true
-          ls "$S/textures/touchcontrols" > diag/touch-textures.txt 2>&1 || true
-          cp patch-report.txt diag/ 2>/dev/null || true
-
-      - name: Upload diagnosis files (also on failure)
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: source-diag
-          path: diag
+          path: native-make.log
           if-no-files-found: ignore
           retention-days: 7
